@@ -641,6 +641,88 @@ if modal is not None:
             "trace_path": trace_path.as_posix(),
         }
 
+    @modal_app.function(
+        image=modal_image,
+        gpu="L4",
+        volumes={MODAL_CACHE_PATH: modal_cache},
+        timeout=60 * 60,
+    )
+    def _modal_inspect_layouts(model_id: str, revision: str, batch_size: int) -> dict[str, Any]:
+        """Inspect inputs before FLA's existing contiguity guard, without editing FLA."""
+        import functools
+        import inspect
+        import importlib.metadata
+
+        import torch
+        from huggingface_hub import snapshot_download
+
+        sys.path.insert(0, "/root/model")
+        from fla.ops.gated_delta_rule.chunk import ChunkGatedDeltaRuleFunction
+
+        original_descriptor = inspect.getattr_static(ChunkGatedDeltaRuleFunction, "forward")
+        original = ChunkGatedDeltaRuleFunction.forward
+        signature = inspect.signature(original)
+        layouts: list[dict[str, Any]] = []
+        calls = 0
+
+        @functools.wraps(original)
+        def logged_forward(*args: Any, **kwargs: Any):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                bound = signature.bind_partial(*args, **kwargs)
+                for name, value in bound.arguments.items():
+                    if isinstance(value, torch.Tensor):
+                        entry = {
+                            "argument": name,
+                            "shape": list(value.shape),
+                            "stride": list(value.stride()),
+                            "contiguous": value.is_contiguous(),
+                            "dtype": str(value.dtype),
+                            "device": str(value.device),
+                        }
+                        layouts.append(entry)
+                        print("FLA_PRE_GUARD " + json.dumps(entry), flush=True)
+            return original(*args, **kwargs)
+
+        model_path = Path(snapshot_download(repo_id=model_id, revision=revision))
+        rows = load_rows(Path(MODAL_DATA_PATH), batch_size)
+        runtime = DeciderRuntime.load(
+            model_path, "cuda", argparse.Namespace(no_graphs=True, no_compile=True)
+        )
+        ChunkGatedDeltaRuleFunction.forward = staticmethod(logged_forward)
+        try:
+            with torch.no_grad():
+                runtime.score_batch(rows)
+            runtime.synchronize()
+        finally:
+            ChunkGatedDeltaRuleFunction.forward = original_descriptor
+        if not layouts:
+            raise RuntimeError("No FLA inputs were captured; this runtime did not call the patched forward")
+        return {
+            "diagnostic_only": True,
+            "gpu": torch.cuda.get_device_name(),
+            "torch_version": torch.__version__,
+            "fla_version": importlib.metadata.version("flash-linear-attention"),
+            "fla_source": inspect.getsourcefile(inspect.unwrap(original)),
+            "model_revision": revision,
+            "batch_size": batch_size,
+            "forward_calls": calls,
+            "first_call_layouts": layouts,
+        }
+
+    @modal_app.local_entrypoint()
+    def inspect_layouts(
+        model_id: str = MODAL_MODEL_ID,
+        revision: str = "main",
+        batch_size: int = 1,
+    ) -> None:
+        """Log one eager request's FLA inputs before the contiguity guard."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        result = _modal_inspect_layouts.remote(model_id, revision, batch_size)
+        print(json.dumps(result, indent=2))
+
     @modal_app.local_entrypoint()
     def modal_main(
         model_id: str = MODAL_MODEL_ID,
