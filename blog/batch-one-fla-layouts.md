@@ -353,3 +353,56 @@ Benchmark the complete preparation sequence, with compilation and autotuning out
 Keep Q/K normalization unchanged in both. Compare graph-replayed execution at batch sizes one, two and four, then integrate only if the sequence improves and verify warmed end-to-end request latency and answer probabilities.
 
 The existing batch-one table attributes approximately $2.76+7.15=9.91$ ms across eighteen layers to convolution preparation plus copies. This is a target budget from an instrumented trace, not a promised speedup or graph-backed baseline. The prototype still performs convolution, activation, reads and output writes.
+
+## Standalone benchmark results
+
+Added `src/bench_packed_output_conv.py` and a baseline kernel in `src/kernels/original_layout_conv.py`. A sanity review of the candidate factory found its metadata, masks and packed addressing consistent; the wrapper now requests `get_packed_conv_kernel(B, T)` rather than hardcoding the factory's sequence argument. The wrapper still restricts sequence length to 2048.
+
+Run the benchmark with:
+
+```bash
+modal run src/bench_packed_output_conv.py \
+  2>&1 | tee data/packed-output-conv-benchmark.log
+```
+
+The baseline reproduces the original generated convolution/SiLU arithmetic and channel-major stores, followed by three copies into preallocated contiguous outputs. It parameterizes sequence length and row masks and uses shape-specific hints, as does the candidate. It is not the exact original model's saved launch configuration.
+
+Both paths use identical random BF16 inputs and weights. Compilation/autotuning and output-agreement checks occur before timing. Buffers are preallocated, and each path is captured as a CUDA graph. Thirty samples measure one hundred graph replays each, alternating path order between samples. CUDA event durations are divided by the replay count.
+
+The user supplied these results from NVIDIA L4, PyTorch `2.14.1+cu130`, Triton `3.8.0`. Output-agreement checks passed at all three batch sizes.
+
+| Batch | Sequence length | Original plus copies median, microseconds | Candidate median, microseconds | Speedup | Saved per layer, microseconds | Reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2048 | 672.804 | 85.775 | 7.844x | 587.028 | 87.25% |
+| 2 | 2048 | 1363.528 | 419.768 | 3.248x | 943.759 | 69.21% |
+| 4 | 2048 | 2858.045 | 837.028 | 3.415x | 2021.017 | 70.71% |
+
+| Batch | Baseline minimum | Baseline p95 sample mean | Candidate minimum | Candidate p95 sample mean |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 530.974 | 713.195 | 82.975 | 87.532 |
+| 2 | 1301.975 | 1427.477 | 417.874 | 424.335 |
+| 4 | 2761.513 | 2921.953 | 834.959 | 841.165 |
+
+All durations in the second table are microseconds per replay. The p95 is across sample means, not individual request latency. Event timing surrounds repeated graph launches and does not establish end-to-end model speed.
+
+“Packed-output” means the modified convolution writes Q, K and V directly into three separate contiguous tensors. It is a descriptive name for this variant, not another model operation. Q/K normalization remains separate and unchanged.
+
+At batch one, extrapolating the saving across eighteen delta layers gives
+
+$$
+18\times587.028\ \mu\mathrm{s}\approx10.57\ \mathrm{ms}.
+$$
+
+This is a model-integration hypothesis, not a measured request-latency saving. Replaying one layer repeatedly reuses its buffers and weights; the complete model has intervening work and different layer weights. The candidate's batch-two duration is nearly five times its batch-one duration, warranting inspection of selected tile configurations and cache behavior. No cause has been established.
+
+## Planned model integration
+
+The proposed source-level insertion point is the uncached full-forward branch of `Qwen3_5GatedDeltaNet.forward`:
+
+1. Retain the combined QKV projection.
+2. Replace the transpose, convolution, transpose-back, split and reshape preparation sequence with `prep_qkv` on the contiguous projection output and convolution weights.
+3. Pass its three contiguous outputs to the existing FLA call, retaining Q/K normalization.
+
+A local patch module under `model/decider`, installed from `Engine.__init__` alongside the existing convolution patch, is the proposed integration mechanism. Preserve the cached branch. The current wrapper's private `.run` launch still needs a verified compiler-compatible integration; do not assume it is captured by `torch.compile` without graph breaks.
+
+The next acceptance conditions are agreement of answer probabilities, disappearance of the three copy launches per delta layer, and improved warmed graph-backed end-to-end median and p95 latency. The normalization-fused variant remains a later experiment. Model integration has not yet been implemented or measured in this discussion.

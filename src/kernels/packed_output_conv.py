@@ -10,84 +10,108 @@ from torch._inductor.runtime.hints import (
     TileHint,
     DeviceProperties,
 )
+from copy import deepcopy
+from functools import lru_cache
+
+BASE_TRITON_META = {
+    "signature": {
+        "in_ptr0": "*bf16",
+        "in_ptr1": "*bf16",
+        "q_ptr": "*bf16",
+        "k_ptr": "*bf16",
+        "v_ptr": "*bf16",
+        "ynumel": "i32",
+        "xnumel": "i32",
+        "YBLOCK": "constexpr",
+        "XBLOCK": "constexpr",
+        "SEQ_LEN": "constexpr",
+    },
+    "device": DeviceProperties(
+        type="cuda",
+        index=0,
+        multi_processor_count=58,
+        cc=89,
+        major=8,
+        regs_per_multiprocessor=65536,
+        max_threads_per_multi_processor=1536,
+        max_threads_per_block=1024,
+        warp_size=32,
+    ),
+    "constants": {"SEQ_LEN": 2048},
+    "native_matmul": False,
+    "enable_fp_fusion": True,
+    "launch_pdl": False,
+    "disable_ftz": False,
+    "configs": [
+        {
+            (0,): [["tt.divisibility", 16]],
+            (1,): [["tt.divisibility", 16]],
+            (2,): [["tt.divisibility", 16]],
+            (3,): [["tt.divisibility", 16]],
+            (4,): [["tt.divisibility", 16]],
+        }
+    ],
+}
+
+BASE_INDUCTOR_META = {
+    "grid_type": "Grid2D",
+    "kernel_name": "mod_triton_poi_fused__unsafe_view_add_constant_pad_nd_mul_select_silu_slice_squeeze_transpose_unsqueeze_0",
+    "mutated_arg_names": [],
+    "optimize_mem": True,
+    "no_x_dim": False,
+    "atomic_add_found": False,
+    "num_load": 8,
+    "num_store": 3,
+    "num_reduction": 0,
+    "autotune_hints": set(),
+    "backend_hash": "0EB81230D0E8E9A69D6E23E8DC64F284B8D62060645A5659C0934B0E14DC7AE4",
+    "assert_indirect_indexing": True,
+    "autotune_local_cache": True,
+    "autotune_pointwise": True,
+    "autotune_remote_cache": None,
+    "force_disable_caches": False,
+    "dynamic_scale_rblock": True,
+    "incremental_autotune": False,
+    "max_autotune": False,
+    "max_autotune_pointwise": False,
+    "min_split_scan_rblock": 256,
+    "spill_threshold": 16,
+    "store_cubin": False,
+    "deterministic": False,
+    "batch_invariant": False,
+    "force_filter_reduction_configs": False,
+    "mix_order_reduction_allow_multi_stages": True,
+    "dynamic_disable_pipelining": True,
+    "are_deterministic_algorithms_enabled": False,
+}
 
 
-@triton_heuristics.pointwise(
-    size_hints={"y": 2048, "x": 8192},
-    tile_hint=TileHint.DEFAULT,
-    filename=__file__,
-    triton_meta={
-        "signature": {
-            "in_ptr0": "*bf16",
-            "in_ptr1": "*bf16",
-            "q_ptr": "*bf16",
-            "k_ptr": "*bf16",
-            "v_ptr": "*bf16",
-            "ynumel": "i32",
-            "xnumel": "i32",
-            "YBLOCK": "constexpr",
-            "XBLOCK": "constexpr",
-            "SEQ_LEN": "constexpr",
+@lru_cache(maxsize=32)
+def get_packed_conv_kernel(batch_size: int, seq_len: int):
+    if batch_size < 1 or seq_len < 1:
+        raise ValueError("batch_size and seq_len must be positive")
+
+    triton_meta = deepcopy(BASE_TRITON_META)
+    triton_meta["constants"]["SEQ_LEN"] = seq_len
+
+    inductor_meta = deepcopy(BASE_INDUCTOR_META)
+    inductor_meta["kernel_name"] = f"packed_output_conv_b{batch_size}_t{seq_len}"
+
+    return triton_heuristics.pointwise(
+        size_hints={
+            "y": triton.next_power_of_2(batch_size * seq_len),
+            "x": triton.next_power_of_2(6144),
         },
-        "device": DeviceProperties(
-            type="cuda",
-            index=0,
-            multi_processor_count=58,
-            cc=89,
-            major=8,
-            regs_per_multiprocessor=65536,
-            max_threads_per_multi_processor=1536,
-            max_threads_per_block=1024,
-            warp_size=32,
-        ),
-        "constants": {"SEQ_LEN": 2048},
-        "native_matmul": False,
-        "enable_fp_fusion": True,
-        "launch_pdl": False,
-        "disable_ftz": False,
-        "configs": [
-            {
-                (0,): [["tt.divisibility", 16]],
-                (1,): [["tt.divisibility", 16]],
-                (2,): [["tt.divisibility", 16]],
-                (3,): [["tt.divisibility", 16]],
-                (4,): [["tt.divisibility", 16]],
-            }
-        ],
-    },
-    inductor_meta={
-        "grid_type": "Grid2D",
-        "kernel_name": "mod_triton_poi_fused__unsafe_view_add_constant_pad_nd_mul_select_silu_slice_squeeze_transpose_unsqueeze_0",
-        "mutated_arg_names": [],
-        "optimize_mem": True,
-        "no_x_dim": False,
-        "atomic_add_found": False,
-        "num_load": 8,
-        "num_store": 3,
-        "num_reduction": 0,
-        "autotune_hints": set(),
-        "backend_hash": "0EB81230D0E8E9A69D6E23E8DC64F284B8D62060645A5659C0934B0E14DC7AE4",
-        "assert_indirect_indexing": True,
-        "autotune_local_cache": True,
-        "autotune_pointwise": True,
-        "autotune_remote_cache": None,
-        "force_disable_caches": False,
-        "dynamic_scale_rblock": True,
-        "incremental_autotune": False,
-        "max_autotune": False,
-        "max_autotune_pointwise": False,
-        "min_split_scan_rblock": 256,
-        "spill_threshold": 16,
-        "store_cubin": False,
-        "deterministic": False,
-        "batch_invariant": False,
-        "force_filter_reduction_configs": False,
-        "mix_order_reduction_allow_multi_stages": True,
-        "dynamic_disable_pipelining": True,
-        "are_deterministic_algorithms_enabled": False,
-    },
-    min_elem_per_thread=0,
-)
+        tile_hint=TileHint.DEFAULT,
+        filename=__file__,
+        triton_meta=triton_meta,
+        inductor_meta=inductor_meta,
+        min_elem_per_thread=0,
+    )(
+        mod_triton_poi_fused__unsafe_view_add_constant_pad_nd_mul_select_silu_slice_squeeze_transpose_unsqueeze_0
+    )
+
+
 @triton.jit
 def mod_triton_poi_fused__unsafe_view_add_constant_pad_nd_mul_select_silu_slice_squeeze_transpose_unsqueeze_0(
     in_ptr0,
@@ -193,7 +217,7 @@ def prep_qkv(input_qkv: torch.Tensor, weight: torch.Tensor):
         k = torch.empty_like(q)
         v = torch.empty_like(q)
 
-        kernel = mod_triton_poi_fused__unsafe_view_add_constant_pad_nd_mul_select_silu_slice_squeeze_transpose_unsqueeze_0
+        kernel = get_packed_conv_kernel(B, T)
         kernel.run(
             input_qkv,
             weight,
