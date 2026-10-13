@@ -583,9 +583,11 @@ if modal is not None:
         use_compile: bool,
         profile_mode: str,
         torch_logs: str,
+        packed_conv: bool,
     ) -> dict[str, Any]:
         import os
 
+        os.environ["DECIDER_PACKED_CONV"] = "1" if packed_conv else "0"
         if torch_logs:
             # Must be set before importing torch for TORCH_LOGS to take effect.
             os.environ["TORCH_LOGS"] = torch_logs
@@ -636,6 +638,7 @@ if modal is not None:
             "compile": use_compile,
             "profile_mode": profile_mode,
             "torch_logs": torch_logs,
+            "packed_conv_layers": runtime.decider.eng.cfg.get("packed_conv_layers", 0),
             "load_seconds": load_seconds,
             **result,
             "trace_path": trace_path.as_posix(),
@@ -736,6 +739,7 @@ if modal is not None:
         use_compile: bool = False,
         profile_mode: str = "eager",
         torch_logs: str = "",
+        packed_conv: bool = True,
     ) -> None:
         """Profile warmed DecisionBench inference on a Modal NVIDIA L4."""
         if rows < batch_size:
@@ -758,6 +762,7 @@ if modal is not None:
             use_compile,
             profile_mode,
             torch_logs,
+            packed_conv,
         )
         print(json.dumps(result, indent=2))
 

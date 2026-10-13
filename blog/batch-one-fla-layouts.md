@@ -406,3 +406,34 @@ The proposed source-level insertion point is the uncached full-forward branch of
 A local patch module under `model/decider`, installed from `Engine.__init__` alongside the existing convolution patch, is the proposed integration mechanism. Preserve the cached branch. The current wrapper's private `.run` launch still needs a verified compiler-compatible integration; do not assume it is captured by `torch.compile` without graph breaks.
 
 The next acceptance conditions are agreement of answer probabilities, disappearance of the three copy launches per delta layer, and improved warmed graph-backed end-to-end median and p95 latency. The normalization-fused variant remains a later experiment. Model integration has not yet been implemented or measured in this discussion.
+
+## Model integration implementation
+
+The shared kernel now lives in `model/decider/packed_conv_kernel.py`; the original `src/kernels/packed_output_conv.py` path re-exports it so standalone tests and benchmarks use the same implementation as serving.
+
+`model/decider/packed_conv.py` registers an opaque CUDA custom operation with a fake implementation describing its three contiguous outputs. This keeps the private Inductor launcher outside tracing while representing the operation as a compiler graph node. A per-instance replacement delta forward retains projection, gates, FLA normalization and readout, replacing only QKV preparation.
+
+Engine installation is restricted to BF16 on NVIDIA L4, with the convolution patch enabled and FP8 disabled. The patched forward falls back to the original method for cached execution, training/gradient-enabled execution, lengths other than 2048 and unsupported geometry/bias/activation. It does not patch the upstream class globally.
+
+`DECIDER_PACKED_CONV=0` disables installation. Modal profiling also exposes `--no-packed-conv` on `src/benchmark.py::modal_main` for baseline comparison; ordinary runs enable it on the supported engine configuration.
+
+`src/check_packed_conv_integration.py` checks custom-op registration, fullgraph capture, model logits/slot probabilities and graph-backed forward timing. Its timing excludes tokenization and readout. Run with:
+
+```bash
+modal run src/check_packed_conv_integration.py --repeats 30
+```
+
+Custom-op registration and `torch.compile(fullgraph=True)` passed on the L4 during the initial integration run. Full-model validation and timing were still in progress at this logging point. Model-wide graph-break freedom and removal of copies should additionally be examined with a fresh compiled profiler trace.
+
+### Initial integration validation result
+
+The Modal integration run completed successfully on NVIDIA L4 against model commit `ff99089b6810691bd79134ec6febb5d9afa6e619`, input shape `[1, 2048]`. Custom-op registration and fullgraph capture passed; the full-model logits agreed within the configured tolerance (`rtol=0.02`, `atol=0.05`), and the tested real-slot temperature-one probabilities had maximum absolute difference **0.0**, with matching argmax. This is one dataset request, not an exhaustive probability/calibration regression.
+
+| Configuration | Median forward ms | p95 forward ms |
+| --- | ---: | ---: |
+| Original | 148.594 | 159.635 |
+| Packed preparation on 18 delta layers | 140.717 | 151.194 |
+
+Ten measurements per configuration gave a median reduction of approximately **7.877 ms**, or **5.3%**. This is a preliminary sequential baseline/candidate comparison of graph-backed forward execution, excluding prompt preparation/readout. It does not establish end-to-end serving latency or stability across request shapes. A fresh kernel trace remains necessary to directly audit copy removal and whole-model graph boundaries.
+
+Run URL: https://modal.com/apps/vijaygoyal0770/main/ap-zPGhxZ9F9FmZnK1aWv3NWv
