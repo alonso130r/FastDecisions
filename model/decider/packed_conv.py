@@ -43,10 +43,15 @@ def _forward(self, hidden_states, cache_params=None, attention_mask=None, **kwar
     mixed = self.in_proj_qkv(hidden_states)
     query, key, value = packed_conv(mixed, self.conv1d.weight)
     z = self.in_proj_z(hidden_states).reshape(batch, seq, -1, self.head_v_dim)
-    b = self.in_proj_b(hidden_states)
-    a = self.in_proj_a(hidden_states)
-    beta = b.sigmoid()
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+    if hasattr(self, '_combined_gate_weight'):
+        from decider.combined_gates import unpack_gate_op
+        combined = F.linear(hidden_states, self._combined_gate_weight)
+        g, beta = unpack_gate_op(combined, self.A_log, self.dt_bias)
+    else:
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
     core_attn_out, _ = mq.torch_chunk_gated_delta_rule(
         query, key, value, g=g, beta=beta, initial_state=None,
         output_final_state=False, use_qk_l2norm_in_kernel=True,

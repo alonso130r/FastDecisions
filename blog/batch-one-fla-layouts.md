@@ -437,3 +437,83 @@ The Modal integration run completed successfully on NVIDIA L4 against model comm
 Ten measurements per configuration gave a median reduction of approximately **7.877 ms**, or **5.3%**. This is a preliminary sequential baseline/candidate comparison of graph-backed forward execution, excluding prompt preparation/readout. It does not establish end-to-end serving latency or stability across request shapes. A fresh kernel trace remains necessary to directly audit copy removal and whole-model graph boundaries.
 
 Run URL: https://modal.com/apps/vijaygoyal0770/main/ap-zPGhxZ9F9FmZnK1aWv3NWv
+
+## Packed convolution: motivation and implementation in words
+
+The optimization came from following measured copies to their producer, rather than replacing an already optimized arithmetic operation. Eighteen delta layers each converted Q, K and V to contiguous storage. The generated convolution producer read token-major projection output but wrote channel-major storage; FLA immediately needed the opposite order. The eager layout differed, which is why confirming compiled strides was essential.
+
+The implemented kernel retains the four-tap convolution and SiLU. Each lane computes one channel for one flattened batch/token row. It reads the current token and three earlier tokens from the combined projection, masks history at the start of each sequence, and uses that channel's four learned weights. It applies SiLU and stores the BF16 result directly into the appropriate Q, K or V allocation. Channels within each output token are adjacent, so the FLA guard has no contiguity work to do for those tensors.
+
+There is still one combined QKV input because the preceding GEMM already produces it. Splitting the input into separate allocations would add work. Only the producer's output placement changes. Three output pointers refer to allocations created by the wrapper; the GPU kernel itself does not allocate memory.
+
+### Packed convolution pseudocode
+
+```text
+WRAPPER(combined_projection, convolution_weights):
+    validate CUDA device, BF16 dtype, contiguous storage and supported dimensions
+    read batch size B and sequence length T
+    allocate separate contiguous BF16 Q, K and V tensors
+    obtain cached launcher for B and T
+    launch over B*T rows and 6144 channels on the current stream
+    return Q, K, V
+
+KERNEL(combined_projection, weights, Q, K, V, row_count, T):
+    identify tile of flattened batch/token rows and combined channels
+    mark rows beyond row_count and channels beyond 6144 invalid
+    derive each row's token position modulo T
+
+    load each channel's four weights as FP32
+    load current token's channel value as FP32
+    load the channel's values from three, two and one tokens earlier
+        use zero when the requested history precedes this sequence
+        suppress loads for invalid rows or channels
+
+    accumulate in the original order:
+        current * weight[3]
+        plus three-tokens-earlier * weight[0]
+        plus two-tokens-earlier * weight[1]
+        plus one-token-earlier * weight[2]
+    apply SiLU to the FP32 result
+
+    if channel belongs to Q:
+        store into Q at this row and local channel
+    if channel belongs to K:
+        store into K at this row and local channel
+    if channel belongs to V:
+        store into V at this row and local channel
+    mask every store and convert to BF16 at the output
+```
+
+The pseudocode's conditionals describe masked stores, not a requirement for divergent branches. The implementation uses three elementwise store masks. The preserved arithmetic order matters because compiler contraction and rounding can affect numerical comparisons.
+
+### Compilation and integration pseudocode
+
+```text
+KERNEL_FACTORY(B, T):
+    if a launcher for this shape is cached:
+        return it
+    copy base compiler metadata
+    set sequence length as a compile-time constant
+    set row size hint to the next power of two of B*T
+    apply Inductor pointwise configuration selection to the shared JIT body
+    cache and return the launcher
+
+AT ENGINE INITIALIZATION:
+    when the configured device and inference mode are supported:
+        replace each delta module's forward on this model instance
+        retain its original forward for fallback
+
+PATCHED DELTA FORWARD(hidden_state, cache):
+    if cached, training, gradient-enabled, wrong length or unsupported geometry:
+        call original forward
+    otherwise:
+        project hidden states into combined QKV
+        invoke the registered packed-convolution custom operation
+        compute the unchanged gates and gate projection
+        call FLA with Q/K normalization still enabled
+        apply the unchanged gated output normalization and output projection
+```
+
+The custom operation's fake implementation describes output shapes and contiguous layouts to the compiler. Its real implementation owns allocation and launches the existing private Inductor wrapper. The opaque operation appears inside a compiled partition without exposing its internal launch machinery to Dynamo. This has been tested at the custom-op boundary and in the integrated model as documented above.
+
+For the next kernel's motivation and pseudocode, see [combined gate transforms](compiled-structure-and-fusion-targets.md#combined-gate-transform-prototype).

@@ -1,11 +1,11 @@
-"""Modal proof of custom-op capture, full-model equivalence, and graph latency."""
+"""Compare original, packed convolution, and packed convolution with combined gates."""
 import json
 from pathlib import Path
 import sys
 import modal
 
 ROOT = Path(__file__).resolve().parents[1]
-app = modal.App('packed-conv-model-check')
+app = modal.App('combined-gates-model-benchmark')
 image = None
 if modal.is_local():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -15,7 +15,7 @@ if modal.is_local():
 
 @app.function(image=image, gpu='L4', timeout=60 * 60,
               volumes={'/cache': modal.Volume.from_name('decider-hf-cache', create_if_missing=True)})
-def check_remote(repeats: int, revision: str):
+def bench_remote(repeats: int, revision: str):
     import os
     import statistics
     import time
@@ -25,20 +25,8 @@ def check_remote(repeats: int, revision: str):
     from decider.infer import Decider
     from decider.systemone import render_question
     from decider.engine import fill_ids
-    from decider.packed_conv import packed_conv, install_packed_conv
-
-    # fullgraph=True fails if our custom-op boundary introduces a graph break.
-    x = torch.randn((1, 2048, 6144), device='cuda', dtype=torch.bfloat16) * 0.5
-    w = torch.randn((6144, 1, 4), device='cuda', dtype=torch.bfloat16) * 0.25
-    with torch.no_grad():
-        torch.library.opcheck(packed_conv, (x, w))
-        eager = packed_conv(x, w)
-        compiled_op = torch.compile(packed_conv, fullgraph=True)
-        compiled = compiled_op(x, w)
-        for a, b in zip(eager, compiled):
-            torch.testing.assert_close(a, b, rtol=0, atol=0)
-    del x, w, eager, compiled
-    print('Custom op registration and fullgraph capture passed', flush=True)
+    from decider.packed_conv import install_packed_conv
+    from decider.combined_gates import install_combined_gates
 
     os.environ['DECIDER_PACKED_CONV'] = '0'
     path = snapshot_download('Mapika/decider-2b', revision=revision)
@@ -56,14 +44,15 @@ def check_remote(repeats: int, revision: str):
     engine = d.eng
     reports = {}
     outputs = {}
-    for name in ('baseline', 'packed'):
-        if name == 'packed':
-            count = install_packed_conv(engine.core)
+    for name in ('baseline', 'packed', 'packed_combined_gates'):
+        if name != 'baseline':
+            count = (install_packed_conv(engine.core) if name == 'packed'
+                     else install_combined_gates(engine.core))
             assert count == 18, count
             engine._fwd_impl = torch.compile(engine._fwd_eager, dynamic=False)
             # Old graph embeds old launches, so it cannot be reused after patching.
             engine.graphs.clear()
-            print(f'Installed packed preparation on {count} delta layers', flush=True)
+            print(f'Installed {name} on {count} delta layers', flush=True)
         with torch.no_grad():
             for _ in range(3):
                 engine.logits_all(ids)
@@ -80,20 +69,27 @@ def check_remote(repeats: int, revision: str):
         reports[name] = {'median_forward_ms': statistics.median(elapsed),
                          'p95_forward_ms': ordered[min(len(ordered)-1, int(.95*len(ordered)))]}
         print(name, reports[name], flush=True)
-    # Check all logits, plus probabilities at the real decision slots.
-    torch.testing.assert_close(outputs['packed'], outputs['baseline'], rtol=.02, atol=.05)
-    slots = items[0]['slots']
-    nopts = items[0]['nopts']
-    max_prob_diff = 0.0
-    for slot, n in zip(slots, nopts):
-        a = outputs['baseline'][0, slot, :n].float().softmax(-1)
-        b = outputs['packed'][0, slot, :n].float().softmax(-1)
-        torch.testing.assert_close(a, b, rtol=.02, atol=.005)
-        assert a.argmax() == b.argmax()
-        max_prob_diff = max(max_prob_diff, (a-b).abs().max().item())
-    return {'custom_op_fullgraph': 'passed', 'model_check': 'passed',
-            'max_slot_probability_difference': max_prob_diff, 'revision': revision,
-            'resolved_model_path': path, 'shape': list(ids.shape), 'repeats': repeats,
+    # Keep tolerance identical across candidates; report rather than hide differences.
+    # The new GEMM shape can change projection rounding before the transform.
+    probability_differences = {}
+    for name in ('packed', 'packed_combined_gates'):
+        torch.testing.assert_close(outputs[name], outputs['baseline'], rtol=.02, atol=.05)
+        max_prob_diff = 0.0
+        for slot, n in zip(items[0]['slots'], items[0]['nopts']):
+            a = outputs['baseline'][0, slot, :n].float().softmax(-1)
+            b = outputs[name][0, slot, :n].float().softmax(-1)
+            torch.testing.assert_close(a, b, rtol=.02, atol=.005)
+            assert a.argmax() == b.argmax(), f'{name}: decision changed'
+            max_prob_diff = max(max_prob_diff, (a-b).abs().max().item())
+        probability_differences[name] = max_prob_diff
+    old = reports['packed']['median_forward_ms']
+    new = reports['packed_combined_gates']['median_forward_ms']
+    return {'model_check': 'passed',
+            'max_slot_probability_difference_vs_original': probability_differences,
+            'gate_incremental_saved_ms': old-new,
+            'gate_incremental_reduction_percent': 100*(old-new)/old,
+            'revision': revision, 'resolved_model_path': path,
+            'shape': list(ids.shape), 'repeats': repeats,
             'timing_scope': 'graph-backed model forward only; excludes tokenization/readout',
             'results': reports}
 
@@ -102,4 +98,4 @@ def check_remote(repeats: int, revision: str):
 def main(repeats: int = 30, revision: str = 'main'):
     if repeats < 2:
         raise ValueError('repeats must be >= 2')
-    print(json.dumps(check_remote.remote(repeats, revision), indent=2))
+    print(json.dumps(bench_remote.remote(repeats, revision), indent=2))

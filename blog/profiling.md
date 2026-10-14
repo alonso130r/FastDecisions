@@ -246,3 +246,11 @@ modal run src/benchmark.py::inspect_layouts --batch-size 1 2>&1 | tee data/l4-la
 ```
 
 Look for `FLA_PRE_GUARD` lines containing argument names, shapes, strides and contiguity. The final JSON includes the FLA version/source location and number of forward calls. This is a diagnostic, not a latency benchmark; the logged layouts come from eager execution and must be compared with compiled producer layouts before implementing an optimization. Because the file now has multiple local entry points, select `::modal_main` explicitly for ordinary benchmark runs.
+
+
+## Follow-up implementation notes
+
+- [Packed convolution motivation, implementation and pseudocode](batch-one-fla-layouts.md#packed-convolution-motivation-and-implementation-in-words), including standalone results and the integrated forward improvement.
+- [Fresh compiled structure and fusion targets](compiled-structure-and-fusion-targets.md), including the source-reviewed combined gate-transform prototype, its motivation and pseudocode.
+
+Earlier candidate rankings and statements about unimplemented kernels are historical observations. The follow-up notes distinguish completed GPU checks from proposed work.
