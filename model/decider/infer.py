@@ -1,0 +1,357 @@
+"""Usable inference API: typed decisions with probabilities, all from one forward pass.
+
+    from decider.infer import Decider
+    d = Decider("runs/r2_full/model")
+    out = d.decide("My card was charged twice for the same purchase.",
+                   [{"question": "Which department should handle this?", "options": ["billing", "technical", "sales"]},
+                    {"question": "How urgent is this?", "options": ["low", "medium", "high"]}])
+    # -> [{'choice': 'billing', 'confidence': 0.97, 'probs': {...}}, {...}]
+"""
+import logging
+
+import torch
+from decider.model import DecisionModel, collate
+from decider.prompt import build, MAX_OPTIONS, resolve_layout, chat_template
+from decider import temperature as TT
+from dataclasses import dataclass
+
+
+@dataclass
+class Q:
+    text: str; options: list; gold: int = 0
+
+
+@dataclass
+class Example:
+    context: str; qs: list; task: str = "infer"; image: bytes = None
+
+
+logger = logging.getLogger(__name__)
+NEUTRAL_NONE = "not listed here"
+
+
+def neutralize_options(options):
+    """The training augmentation used the literal 'none of the above', and the model learned that exact string as an
+    abstain signal (it abstains even on clear cases when the string is offered). Any option that reads like it is
+    rewritten to a neutral phrasing for the model and mapped back in the output."""
+    out, back = [], {}
+    for o in options:
+        key = o.strip().lower()
+        if key.startswith("none of the above") or key in ("none of the above", "none", "n/a", "none of these"):
+            out.append(NEUTRAL_NONE); back[NEUTRAL_NONE] = o
+        else:
+            out.append(o)
+    return out, back
+
+
+class _NoShuffle:                              # keep option order as given
+    def shuffle(self, x): pass
+    def sample(self, xs, k): return xs[:k]
+
+
+class CompiledSchema:
+    def __init__(self, d, rqs, h, index):
+        from decider.systemone import row_types
+        self.d, self.rqs, self.h, self.index = d, rqs, h, index
+        self.types = row_types(rqs, index)                         # answer type of every schema row (decider.temperature)
+
+    def batch(self, states, max_state_tokens=32768):
+        from decider.systemone import render_state, assemble
+        T = TT.for_types(self.d.T_schema, self.d.T_schema_by_type, self.types)
+        probs = self.d._se.score(self.h, [render_state(s) for s in states], temperature=T, max_ctx_tokens=max_state_tokens)
+        return [{"model": self.d.name, "answers": assemble(self.rqs, self.index, [p.tolist() for p in pr])} for pr in probs]
+
+    def __call__(self, state, max_state_tokens=32768):
+        return self.batch([state], max_state_tokens)[0]
+
+
+class Decider:
+    """One-pass decisions with automatic CUDA, MPS, or CPU device selection.
+
+    CUDA uses shape-bucketed graphs by default. MPS defaults to float16 and uses
+    the optional MPS patch; CPU defaults to bfloat16. Set ``use_graphs=False``
+    for eager execution or debugging.
+    """
+    def __init__(self, path, device=None, dtype=None, temperature=None, abstain_below=0.0, use_graphs=None, temperature_by_type=None, compile=True):
+        """The prompt layout comes from decider_config.json: "layout": "chat" (chat-trained checkpoints) wraps every prompt in the
+        tokenizer's chat template (decider.prompt.build_chat); no "layout" key is the plain layout of every earlier model.
+        An unknown layout raises ValueError before the weights are loaded.
+
+        Temperatures (decider.temperature): decider_config.json "temperature" and the optional "temperature_by_type"
+        {"choice": T, "noul": T, "score": T}.  temperature= overrides "temperature" and switches the config's by-type map off;
+        temperature_by_type= sets the map explicitly.  An invalid temperature or map key raises ValueError before the weights
+        are loaded."""
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        if dtype is None:
+            dtype = torch.float16 if str(device).startswith("mps") else torch.bfloat16
+        logger.info("Decider device=%s dtype=%s", device, dtype)
+        import json, os
+        cfg = {}
+        try:                                          # model folder may carry decider_config.json (temperature, flags)
+            from huggingface_hub import hf_hub_download
+            cfg_path = os.path.join(path, "decider_config.json") if os.path.isdir(path) else hf_hub_download(path, "decider_config.json")
+            cfg = json.load(open(cfg_path))
+        except Exception:
+            pass
+        self.layout = resolve_layout(cfg)
+        (temperature, self.T_by_type), (T_schema, self.T_schema_by_type) = TT.from_config(cfg, temperature, temperature_by_type)
+        self.neutralize_none = bool(cfg.get("neutralize_none", True))   # v4 and earlier learned the literal string as an abstain signal
+        if use_graphs is None:
+            use_graphs = str(device).startswith("cuda")
+        if use_graphs:
+            from decider.engine import Engine
+            self.eng = Engine(path, device=device, dtype=dtype, compile=compile); self.m = self.eng.m
+        else:
+            if str(device).startswith("mps"):
+                from decider.mps_ops import patch_mps
+                patch_mps()
+            self.eng = None; self.m = DecisionModel(path, dtype=dtype, grad_ckpt=False).to(device).eval()
+        self.chat = chat_template(self.m.tok) if self.layout == "chat" else None      # None: plain layout, prompts as in 1.1.x
+        self.dev = device; self.T = temperature; self.abstain_below = abstain_below
+        self.name = "decider-" + str(cfg.get("version", "dev"))
+        self.schema_first = bool(cfg.get("schema_first", False)) and self.eng is not None      # default layout. Questions-first (the cacheable one) costs accuracy
+        self.T_schema = T_schema                                              # (about 1.5 points on fixed label sets, more elsewhere): opt in with schema()
+        self.isolated_levels = bool(cfg.get("isolated_levels", False))      # Score levels judged one per row (v8+)
+        self._se = None; self._schemas = {}
+
+    def _decide_items(self, requests, max_ctx_tokens=1536):
+        """The prompt rows of decide_batch: -> (requests with neutralized options, one item per request)."""
+        exs = []
+        if self.neutralize_none:
+            requests = [(context, [dict(q, options=neutralize_options(q["options"])[0], _back=neutralize_options(q["options"])[1]) for q in qs]) for context, qs in requests]
+        for context, qs in requests:
+            for q in qs:
+                assert 2 <= len(q["options"]) <= MAX_OPTIONS, f"2..{MAX_OPTIONS} options required"
+            exs.append(Example(context, [Q(q["question"], list(q["options"]), 0) for q in qs], "infer"))
+        items = [build(e, self.m.tok, _NoShuffle(), max_options=MAX_OPTIONS, max_ctx_tokens=max_ctx_tokens, chat=self.chat) for e in exs]
+        for it, (_, qs) in zip(items, requests):                     # answer type per slot: a plain question is "choice"
+            it["types"] = [q.get("_type", "choice") for q in qs]
+        return requests, items
+
+    @torch.no_grad()
+    def decide_batch(self, requests, max_ctx_tokens=1536):
+        """requests: list of (context:str, questions:list[dict(question, options)]). One forward pass for everything."""
+        requests, items = self._decide_items(requests, max_ctx_tokens)
+        T = TT.for_items(self.T, self.T_by_type, items)                  # the scalar self.T when there is no by-type map
+        if self.eng is not None:
+            probs = torch.cat(self.eng.score_items(items, temperature=T))
+        else:
+            b = collate(items, self.m.tok.pad_token_id)
+            logits = self.m.slot_logits(b["input_ids"].to(self.dev), b["attention_mask"].to(self.dev), b["slot_idx"].to(self.dev),
+                                        b["slot_batch"].to(self.dev), b["nopts"].to(self.dev))
+            probs = TT.scaled_softmax(logits, TT.slot_temperatures(T, items)).cpu()
+        out, k = [], 0
+        for context, qs in requests:
+            res = []
+            for q in qs:
+                p = probs[k, :len(q["options"])].tolist(); k += 1
+                j = max(range(len(p)), key=p.__getitem__); back = q.get("_back", {})
+                names = [back.get(o, o) for o in q["options"]]
+                res.append(dict(choice=names[j] if p[j] >= self.abstain_below else None, confidence=p[j],
+                                probs={o: pi for o, pi in zip(names, p)}, probs_list=p))
+            out.append(res)
+        return out
+
+    def decide(self, context, questions, **kw):
+        return self.decide_batch([(context, questions)], **kw)[0]
+
+    # ---- Jev-shaped interface (decider.systemone): state + {id: Choice | Score | Noul with criteria}
+    # ---- schema cache (v7+): the questions are run once, requests only run the state (decider.schema_engine)
+    def schema(self, questions, independent=True, isolated=None, compile=False):
+        """Compile a fixed set of Jev-shaped questions: schema(state) -> answers; schema.batch([state, ...]) -> [answers]."""
+        import json
+        from decider.schema_engine import SchemaEngine
+        from decider.systemone import render_question
+        isolated = self.isolated_levels if isolated is None else isolated
+        key = (json.dumps(questions, sort_keys=True, ensure_ascii=False), independent, isolated)
+        if key not in self._schemas:
+            if self._se is None: self._se = SchemaEngine(self.eng, chat=self.chat)
+            if len(self._schemas) >= 64:                                  # drop the oldest schema and its graphs
+                old = next(iter(self._schemas)); hid = self._schemas.pop(old)[1].id
+                for k in [k for k in self._se.graphs if k[0] == hid]: del self._se.graphs[k]
+            from decider.systemone import plan_rows
+            rqs = {k: render_question(v) for k, v in questions.items()}
+            rows, index = plan_rows(rqs, isolated and independent)
+            h = self._se.prepare(rows, independent=independent, compile=compile)      # compile=True: ~25 s per (batch, length) shape, 1.6x faster after
+            self._schemas[key] = (rqs, h, index)
+        return CompiledSchema(self, *self._schemas[key])
+
+    def system_one(self, state, questions, independent=True, max_state_tokens=32768, max_fwd_tokens=65536, layout=None, isolated=None):
+        layout = layout or ("schema_first" if self.schema_first else "state_first")
+        isolated = (self.isolated_levels if isolated is None else isolated) and independent
+        if layout == "schema_first" and self.eng is not None:
+            return self.schema(questions, independent, isolated)(state, max_state_tokens)
+        """independent=True scores every question in its own row (state + that question only), so adding, removing or
+        reordering questions cannot change any other answer; the state is run once and its cache forked to every
+        question (Engine.score_shared).  independent=False packs all questions behind one copy of the state in one row
+        (later questions can then see earlier question texts)."""
+        from decider.systemone import unique_tokens, assemble
+        rqs, index, items = self._system_one_items(state, questions, independent, max_state_tokens, layout, isolated)
+        flatp = self._system_one_probs(items, layout, max_fwd_tokens, TT.for_items(self.T, self.T_by_type, items))
+        return {"model": self.name, "answers": assemble(rqs, index, flatp),
+                "usage": {"input_tokens": unique_tokens(items), "output_tokens": 0}}
+
+    @torch.no_grad()
+    def _system_one_probs(self, items, layout, max_fwd_tokens=65536, temperature=None):
+        """Score system_one's uncached rows.  temperature: as Engine.score_items takes it (a number, or one entry per item).
+        -> one probability list per question row, in row order."""
+        if self.eng is not None and len(items) > 1 and layout == "state_first":
+            probs = self.eng.score_shared(items, temperature=temperature)
+        else:
+            probs = []; per = max(1, max_fwd_tokens // max(len(it["ids"]) for it in items))
+            for i in range(0, len(items), per):
+                T = TT.item_slice(temperature, i, i + per)
+                if self.eng is not None:
+                    probs += self.eng.score_items(items[i:i + per], temperature=T)
+                else:
+                    bt = collate(items[i:i + per], self.m.tok.pad_token_id)
+                    lg = self.m.slot_logits(*[bt[k].to(self.dev) for k in ("input_ids", "attention_mask", "slot_idx", "slot_batch", "nopts")])
+                    pr = TT.scaled_softmax(lg, TT.slot_temperatures(T, items[i:i + per])).cpu(); c = 0
+                    for it in items[i:i + per]:
+                        probs.append(pr[c:c + len(it["slots"])]); c += len(it["slots"])
+        return [p.tolist() for ps in probs for p in ps]
+
+    def _system_one_items(self, state, questions, independent=True, max_state_tokens=32768, layout=None, isolated=None):
+        """The prompt rows of system_one's uncached path: -> (rendered questions, answer index, items)."""
+        from decider.systemone import render_state, render_question, plan_rows, row_types
+        layout = layout or ("schema_first" if self.schema_first else "state_first")
+        isolated = (self.isolated_levels if isolated is None else isolated) and independent
+        ctx = render_state(state); rqs = {k: render_question(v) for k, v in questions.items()}
+        opts = (lambda r: neutralize_options(r["options"])[0]) if self.neutralize_none else (lambda r: list(r["options"]))
+        flat, index = plan_rows(rqs, isolated)
+        rows = [[r] for r in flat] if independent else [flat]
+        items = [build(Example(ctx, [Q(r["question"], opts(r), 0) for r in row]), self.m.tok, _NoShuffle(), max_options=MAX_OPTIONS,
+                       max_ctx_tokens=max_state_tokens, layout=layout, chat=self.chat) for row in rows]
+        types = row_types(rqs, index)                                 # answer type per row (decider.temperature)
+        for it, ts in zip(items, [[t] for t in types] if independent else [types]):
+            it["types"] = ts
+        return rqs, index, items
+
+    # ---- typed schema interface: {question: {"type": "bool"} | {"type": "choice", "options": [...]}
+    #                                         | {"type": "scale", "legend": {"0": "none", "1": "low", ...}}}
+    SCHEMA_FORM = ('schema: a map {question: field}, each field one of {"type": "choice", "options": [option strings]}, '
+                   '{"type": "bool"} or {"type": "scale", "legend": [descriptions] or {level number: description}}')
+
+    @staticmethod
+    def _check_schema(schema):
+        """Raise ValueError naming the expected form when `schema` does not have it (the HTTP server turns this into a 422).
+        Every schema that 1.1.2 answered stays accepted, except options or a legend given as a bare string (1.1.2 split it into
+        characters); an empty schema is answered with {}."""
+        import json, math
+        form = Decider.SCHEMA_FORM
+        if schema is None:
+            raise ValueError("schema is required; " + form)
+        if not isinstance(schema, dict):
+            raise ValueError(f"schema is a {type(schema).__name__}; " + form)
+        for qtext, spec in schema.items():
+            where = f"schema[{qtext!r}]"
+            if not isinstance(spec, dict):
+                raise ValueError(f"{where} is a {type(spec).__name__}, not a field object; " + form)
+            t = spec.get("type", "choice")
+            if t == "choice":
+                opts = spec.get("options")
+                if not isinstance(opts, (list, tuple, dict)) or not opts or not all(isinstance(o, str) for o in opts):
+                    raise ValueError(f'{where}: "options" must be a non-empty list of strings; ' + form)
+            elif t == "scale":
+                leg = spec.get("legend")
+                if not isinstance(leg, (list, tuple, dict)) or not leg:
+                    raise ValueError(f'{where}: "legend" must be a non-empty list or {{level number: description}} map; ' + form)
+                try:                                           # the legend is echoed in the answer, which must serialise
+                    json.dumps(leg, allow_nan=False)
+                except (TypeError, ValueError):
+                    raise ValueError(f'{where}: the "legend" contains a value that is not finite JSON (NaN or Infinity); ' + form)
+                if isinstance(leg, dict):
+                    try:
+                        ok = all(math.isfinite(float(k)) for k in leg)
+                    except (TypeError, ValueError, OverflowError):
+                        ok = False
+                    if not ok:
+                        raise ValueError(f'{where}: the keys of a "legend" map must be finite numbers, e.g. {{"0": "none", "1": "low"}}; ' + form)
+            elif t != "bool":
+                raise ValueError(f"{where}: unknown field type {t!r}; " + form)
+
+    @staticmethod
+    def _schema_to_questions(schema):
+        Decider._check_schema(schema)
+        qs = []
+        for qtext, spec in schema.items():
+            t = spec.get("type", "choice")
+            if t == "bool":
+                qs.append(dict(question=qtext, options=["no", "yes"], _type="noul"))
+            elif t == "choice":
+                qs.append(dict(question=qtext, options=list(spec["options"]), _type="choice"))
+            elif t == "scale":
+                leg = spec["legend"]
+                keys = sorted(leg, key=lambda k: float(k)) if isinstance(leg, dict) else list(range(len(leg)))
+                labels = [f"{k}: {leg[k]}" if isinstance(leg, dict) else f"{i}: {leg[i]}" for i, k in enumerate(keys)]
+                qs.append(dict(question=qtext, options=labels, _keys=keys, _legend=leg, _type="score"))
+            else:
+                raise ValueError(f"unknown field type {t}")
+        return qs
+
+    def decide_json_batch(self, requests, **kw):
+        """requests: list of (context, schema). Returns one dict per context keyed by question."""
+        qss = [self._schema_to_questions(schema) for _, schema in requests]
+        raw = self.decide_batch([(ctx, qs) for (ctx, _), qs in zip(requests, qss)], **kw)
+        out = []
+        for (ctx, schema), qs, res in zip(requests, qss, raw):
+            o = {}
+            for (qtext, spec), q, r in zip(schema.items(), qs, res):
+                t = spec.get("type", "choice")
+                if t == "bool":
+                    o[qtext] = {"noul": round(r["probs"]["yes"], 4), "type": "noul"}
+                elif t == "choice":
+                    o[qtext] = {"choice": r["choice"], "confidence": round(r["confidence"], 4), "type": "choice",
+                                "probabilities": {k: round(v, 4) for k, v in r["probs"].items()}}
+                else:
+                    p = [r["probs"][lab] for lab in q["options"]]
+                    keys = q["_keys"]; n = len(p)
+                    score = sum(float(k) * pi for k, pi in zip(keys, p))          # expected level on the legend scale
+                    j = max(range(n), key=p.__getitem__)
+                    o[qtext] = {"score": round(score, 2), "confidence": round(p[j], 4), "type": "scale", "legend": q["_legend"],
+                                "probabilities": {str(keys[i]): round(pi, 4) for i, pi in enumerate(p)}}
+            out.append(o)
+        return out
+
+    def decide_json(self, context, schema, **kw):
+        return self.decide_json_batch([(context, schema)], **kw)[0]
+
+
+if __name__ == "__main__":
+    import sys, json, time
+    d = Decider(sys.argv[1] if len(sys.argv) > 1 else "runs/r1_200k/model")
+    demo = [
+        ("My card was charged twice for the same purchase and I want the extra charge refunded.",
+         [{"question": "Which department should handle this?", "options": ["billing", "technical support", "sales"]},
+          {"question": "What is the customer's sentiment?", "options": ["angry", "neutral", "happy"]},
+          {"question": "Does this need a refund action?", "options": ["no", "yes"]}]),
+        ("hey can u turn the lights off in the kitchen",
+         [{"question": "What is the intent?", "options": ["smart home control", "set alarm", "play music", "none of the above"]},
+          {"question": "Is this request toxic?", "options": ["no", "yes"]}]),
+        ("The quarterly report shows revenue fell 12% while costs rose sharply.",
+         [{"question": "What is the financial sentiment?", "options": ["bearish", "neutral", "bullish"]}]),
+    ]
+    t = time.time(); res = d.decide_batch(demo); dt = time.time() - t
+    for (ctx, qs), r in zip(demo, res):
+        print("\n>>", ctx)
+        for q, a in zip(qs, r):
+            print(f"   {q['question']:45s} -> {a['choice']!s:22s} p={a['confidence']:.2f}  " + " ".join(f"{o}:{p:.2f}" for o, p in a['probs'].items()))
+    print(f"\n{sum(len(q) for _, q in demo)} decisions in {dt*1000:.0f} ms (one forward pass)")
+    schema = {
+        "Revenue currently impacted?": {"type": "bool"},
+        "What business impact?": {"type": "choice", "options": ["none", "degraded", "outage"]},
+        "Integration issue present?": {"type": "bool"},
+        "Account health status?": {"type": "choice", "options": ["healthy", "watch", "at risk"]},
+        "Which incident scope?": {"type": "choice", "options": ["single_account", "multi_account", "platform_wide"]},
+        "Security concern present?": {"type": "bool"},
+        "Duplicate charge reported?": {"type": "bool"},
+        "Churn likelihood level?": {"type": "scale", "legend": {"0": "none", "1": "low", "2": "medium", "3": "high"}},
+        "Human attention needed?": {"type": "bool"},
+        "Immediate feature request?": {"type": "bool"},
+    }
+    ctx = ("Hi, since this morning our Stripe webhook integration stopped firing and our checkout is down for all customers. "
+           "We are losing orders every minute and our partner launch is on Thursday. Also I think we got billed twice last week. "
+           "If this is not fixed today we will have to look at other providers.")
+    t = time.time(); js = d.decide_json(ctx, schema); dt = time.time() - t
+    print(f"\n>> {ctx[:80]}...\n" + json.dumps(js, indent=1)[:3000]); print(f"{len(schema)} typed fields in {dt*1000:.0f} ms (one forward pass)")

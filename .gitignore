@@ -5,6 +5,4 @@ tmp/
 model/*
 !model/decider/
 model/decider/*
-!model/decider/engine.py
-!model/decider/packed_conv.py
-!model/decider/packed_conv_kernel.py
+!model/decider/*.py
