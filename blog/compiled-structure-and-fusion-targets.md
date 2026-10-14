@@ -382,3 +382,7 @@ See [persistent residual RMSNorm](persistent-residual-rmsnorm.md) for motivation
 ## Persistent residual RMSNorm: failed experiment
 
 The [persistent residual RMSNorm experiment](persistent-residual-rmsnorm.md#outcome-failed-optimization-experiment) is marked unsuccessful. Batch-one isolated median improved from 39.373 to 20.838 microseconds, but integrated forward median increased from 132.706 to 132.985 ms. Full-logit validation failed on 6,902 of 522,240 entries (1.3%), with maximum absolute difference 0.2421875 against absolute tolerance 0.05 and relative tolerance 0.02. Slot-probability checks were not reached, so this is not a measured decision-accuracy loss. Keep the patch opt-in and disabled by default; the numerical cause has not been established.
+
+## Native GQA follow-up
+
+The subsequent full-attention experiment, including layout/stride handling, the offline tile sweep, first-layer numerical diagnostics, the FP16 trial and rollback, and integrated measurements is recorded in [native GQA](native-gqa.md). The combined packed-convolution/native-GQA path reduced batch-one GPU forward median from 142.885 to 126.938 ms in the matched benchmark, with numerical assertions disabled and no changed decisions across four checked slots. Broader decision-quality validation remains outstanding. Decision-slot-only projection is the next discussed prototype and has not been implemented.
