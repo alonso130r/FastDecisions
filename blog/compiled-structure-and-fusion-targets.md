@@ -371,3 +371,9 @@ The gate experiment has **not demonstrated a model-level improvement**. The obse
 Keep packed convolution as the current winner and combined gates opt-in/experimental. No change to the normal inference default is justified by these results. Convolution plus Q/K normalization fusion is the next candidate to investigate.
 
 If revisiting gates, alternate measurements of already captured packed and combined-gate graphs, inspect integrated per-kernel timings, and include combined GEMM plus compiled PyTorch transforms as a control. Those checks can distinguish launch/implementation differences from measurement variation and isolate the handwritten transform's contribution.
+
+## Next experiment: persistent residual RMSNorm
+
+The combined-gate results above are already recorded and remain the reason to leave that optimization experimental. Subsequent inspection prioritized explicit repeated reads in the generated residual-plus-RMSNorm kernel. The replacement now retains complete rows through the reduction, with corrected `XBLOCK` row coverage, persistent-reduction metadata and a launcher.
+
+See [persistent residual RMSNorm](persistent-residual-rmsnorm.md) for motivation, arithmetic/rounding requirements, metadata cleanup and pseudocode. This kernel has not yet been GPU-tested or benchmarked.
