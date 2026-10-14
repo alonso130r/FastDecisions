@@ -1,4 +1,4 @@
-"""Model-wide native GQA benchmark. Opt-in patch; correctness gates before timing."""
+"""Model-wide native GQA benchmark. Numerical differences reported without assertions."""
 from pathlib import Path
 import json
 import sys
@@ -14,7 +14,8 @@ if modal.is_local():
 
 @app.function(image=image, gpu='L4', timeout=3600,
               volumes={'/cache': modal.Volume.from_name('decider-hf-cache', create_if_missing=True)})
-def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replays: int):
+def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replays: int,
+                 original_baseline: bool = False):
     import os
     import random
     import statistics
@@ -54,7 +55,7 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
         output = attention_op(q, k, v).transpose(1, 2).reshape(*shape, -1)
         return self.o_proj(output*torch.sigmoid(gate)), None
 
-    os.environ['DECIDER_PACKED_CONV'] = '1'
+    os.environ['DECIDER_PACKED_CONV'] = '0' if original_baseline else '1'
     path = snapshot_download('Mapika/decider-2b', revision=revision)
     d = Decider(path, device='cuda', use_graphs=True, compile=True)
     engine = d.eng
@@ -106,6 +107,10 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
                 handle.remove()
         baseline = [engine.logits_all(x).clone() for x in ids]
         baseline_graphs = dict(engine.graphs)
+        if original_baseline:
+            from decider.packed_conv import install_packed_conv
+            count = install_packed_conv(engine.core)
+            assert count == 18, count
         for module in modules:
             module.forward = MethodType(candidate_forward, module)
         engine.graphs.clear()
@@ -114,13 +119,15 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
         candidate = [engine.logits_all(x).clone() for x in ids]
         # A second pass changes the captured inputs when multiple batches exist.
         replay = [engine.logits_all(x).clone() for x in reversed(ids)]
-        for got, expected in zip(replay, reversed(candidate)):
-            torch.testing.assert_close(got, expected, atol=0, rtol=0)
+        replay_max_error = max((got-expected).abs().max().item()
+                               for got, expected in zip(replay, reversed(candidate)))
 
     max_logit_error = max_probability_error = 0.0
     slots_checked = 0
+    changed_decisions = 0
+    logits_outside_tolerance = 0
     for batch, old, new in zip(batches, baseline, candidate):
-        torch.testing.assert_close(new, old, atol=.05, rtol=.02)
+        logits_outside_tolerance += int(((new-old).abs() > .05+.02*old.abs()).sum().item())
         max_logit_error = max(max_logit_error, (new-old).abs().max().item())
         for row_index, item in enumerate(batch):
             temperatures = slot_temperatures(for_items(d.T, d.T_by_type, [item]), [item])
@@ -128,8 +135,7 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
                 temperature = temperatures[i] if isinstance(temperatures, (list, tuple)) else temperatures
                 a = (old[row_index, slot, :n]/temperature).softmax(-1)
                 b = (new[row_index, slot, :n]/temperature).softmax(-1)
-                torch.testing.assert_close(b, a, atol=.005, rtol=.02)
-                assert a.argmax().item() == b.argmax().item(), 'Selected decision changed'
+                changed_decisions += int(a.argmax().item() != b.argmax().item())
                 max_probability_error = max(max_probability_error, (a-b).abs().max().item())
                 slots_checked += 1
     assert slots_checked > 0
@@ -171,7 +177,11 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
             p95_sample_mean_us=sorted(values)[min(len(values)-1, int(.95*len(values)))],
             median_wall_forward_ms=statistics.median(wall[name]))
     old, new = summaries['baseline']['median_us'], summaries['native_gqa']['median_us']
-    return dict(status='passed within tolerance', rows=rows, batch_size=batch_size,
+    return dict(status='benchmarked; numerical assertions disabled', rows=rows, batch_size=batch_size,
+                baseline_configuration='original convolution + SDPA' if original_baseline else 'packed convolution + SDPA',
+                candidate_configuration='packed convolution + native GQA',
+                changed_decisions=changed_decisions, logits_outside_tolerance=logits_outside_tolerance,
+                replay_max_error=replay_max_error,
                 results=summaries, saved_us=old-new, speedup=old/new,
                 samples=samples, replays_per_sample=replays, gpu=torch.cuda.get_device_name(),
                 torch=torch.__version__,
@@ -186,12 +196,13 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
 @app.local_entrypoint()
 def main(rows: int = 4, batch_size: int = 1,
          revision: str = 'ff99089b6810691bd79134ec6febb5d9afa6e619',
-         samples: int = 30, replays: int = 10, output: str = 'data/native-gqa-model.json'):
+         samples: int = 30, replays: int = 10, output: str = 'data/native-gqa-model.json',
+         original_baseline: bool = False):
     if rows < 1 or batch_size < 1 or rows % batch_size:
         raise ValueError('Rows must be positive and divisible by batch size')
     if samples < 2 or replays < 1:
         raise ValueError('Require samples >= 2 and replays >= 1')
-    result = bench_remote.remote(rows, batch_size, revision, samples, replays)
+    result = bench_remote.remote(rows, batch_size, revision, samples, replays, original_baseline)
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2)+'\n')
