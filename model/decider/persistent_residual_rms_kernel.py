@@ -65,7 +65,7 @@ def persistent_residual_rms(
     b = tl.load(in_ptr1 + offset, mask=valid, other=0.0).to(tl.float32)
     residual = a + b
     sum_squares = tl.sum(residual * residual, axis=1)[:, None]
-    inv_rms = libdevice.rsqrt(sum_squares / 2048.0 + 1e-6)
+    inv_rms = libdevice.rsqrt(sum_squares / 2048.0)
     weight = tl.load(in_ptr2 + feat).to(tl.float32)
     normalized = residual * inv_rms
     output = normalized * (weight + 1.0)

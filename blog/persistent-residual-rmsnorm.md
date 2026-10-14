@@ -1,5 +1,7 @@
 # Persistent residual RMSNorm: removing repeated row reads
 
+**Final outcome: failed experiment.** Faster in isolation, but integrated numerical validation failed and model-forward latency did not improve. See [outcome and measurements](#outcome-failed-optimization-experiment). Earlier sections record the implementation process.
+
 This experiment follows the [combined-gate results](compiled-structure-and-fusion-targets.md#combined-gate-benchmark-results). The gate experiment passed numerical comparisons and improved its isolated projection/transform sequence, but did not demonstrate an integrated model speedup. Its results are already recorded in that note.
 
 ## Previous experiment and motivation for changing direction
@@ -104,3 +106,70 @@ The rewritten file passed Python syntax and diff checks at implementation time. 
 The next benchmark should compare against the exact generated two-pass residual-plus-RMSNorm sequence, using matching input layouts and dtypes. Include multiple row counts and partial final row tiles to exercise block coverage. Preserve compilation/autotuning outside timing, compare warmed CUDA graph replay, and inspect selected row block sizes and register/spill behavior where available.
 
 Only after a standalone gain should the operation replace the corresponding model boundary. It needs compiler-compatible integration and full-model probability/latency validation. Do not replace a differently rounded eager residual operation merely because its mathematical formula looks equivalent.
+
+## Benchmark runners
+
+The user clarified that the requested scripts should benchmark rather than provide standalone test suites. Removed the isolated testing script and converted/renamed the model checker. Neither benchmark has been run.
+
+`src/bench_persistent_residual_rms.py` compares the generated two-pass baseline against the persistent kernel for batches one, two and four at sequence length 2048. It preallocates outputs, warms compilation/autotuning, checks numerical agreement and times alternating CUDA graph replays with CUDA events. The baseline preserves generated arithmetic but retunes for the shape. Reports include selected configurations and sample-mean timing percentiles.
+
+`src/bench_persistent_residual_rms_model.py` compares packed-convolution inference against the same model with the experimental residual RMSNorm patch on eighteen delta decoder layers. It validates logits and calibrated slot probabilities for real requests, reports warmed graph-backed forward median/p95, and leaves serving defaults unchanged. It excludes tokenization/readout and measures baseline then candidate sequentially.
+
+```bash
+modal run src/bench_persistent_residual_rms.py \
+  2>&1 | tee data/persistent-rms-benchmark.log
+modal run src/bench_persistent_residual_rms_model.py \
+  --rows 4 --batch-size 1 --repeats 30 \
+  2>&1 | tee data/persistent-rms-model-b1.log
+modal run src/bench_persistent_residual_rms_model.py \
+  --rows 4 --batch-size 2 --repeats 30 \
+  2>&1 | tee data/persistent-rms-model-b2.log
+```
+
+The opt-in custom-op and decoder patch lives in `model/decider/persistent_residual_rms.py`. No GPU correctness or speed result is established yet. Numerical checks in benchmark runners are guards against reporting timings for mismatched outputs, not an independent exhaustive test suite.
+
+## Outcome: failed optimization experiment
+
+**Status: unsuccessful; do not enable by default.** The persistent kernel improved isolated timing but failed integrated numerical validation and did not improve model-forward latency. It remains an opt-in experimental implementation.
+
+### Isolated performance
+
+User-reported NVIDIA L4 run, PyTorch `2.14.1+cu130`, Triton `3.8.0`. Thirty samples each measured one hundred CUDA graph replays on preallocated buffers, after compilation and autotuning. Numerical comparisons passed within the isolated tolerances (`rtol=0.008`, `atol=0.002`).
+
+| Batch | Shape | Two-pass median, microseconds | Persistent median, microseconds | Speedup | Saved microseconds |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | `[1, 2048, 2048]` | 39.373 | 20.838 | 1.889x | 18.534 |
+| 2 | `[2, 2048, 2048]` | 122.163 | 61.788 | 1.977x | 60.375 |
+| 4 | `[4, 2048, 2048]` | 406.205 | 381.609 | 1.064x | 24.596 |
+
+The two-pass baseline selected `XBLOCK=2`, `R0_BLOCK=1024`, sixteen warps and one stage. The persistent kernel selected `XBLOCK=1`, eight warps and one stage. These configurations were unchanged across the three batch sizes. The disproportionate batch-four increase has no confirmed explanation; cache behavior is a hypothesis, not a finding.
+
+The batch-one saving across eighteen replacements extrapolated to approximately 0.334 ms. This was not an integrated speedup prediction validated by measurement.
+
+### Model-forward timing and numerical failure
+
+The model-wide runner reported these graph-backed forward timings, with packed convolution enabled in both configurations:
+
+| Configuration | Median forward ms | p95 forward ms |
+| --- | ---: | ---: |
+| Packed baseline | 132.705901 | 136.929095 |
+| Persistent residual RMSNorm candidate | 132.985153 | 137.351037 |
+
+The candidate median was approximately **0.279 ms slower**, a **0.21% increase**. Its p95 was approximately **0.422 ms higher**. The sequential run alone does not establish a stable performance regression, but it provides no demonstrated integrated gain.
+
+The run then failed its full-logit comparison:
+
+- **6,902 of 522,240 logits**, approximately **1.3%**, were outside the combined tolerance `rtol=0.02`, `atol=0.05`.
+- Greatest absolute difference: **0.2421875**, at index `(0, 226, 135)`; absolute tolerance was 0.05.
+- Greatest relative difference: **infinity**, at index `(0, 387, 167)`, reflecting a zero reference denominator rather than proof of an infinite candidate value.
+- The assertion occurred before slot-probability comparisons. Whether served probabilities or selected decisions changed was **not established** by this failed run.
+
+These are differences from the baseline model, not measured task-accuracy losses. Do not describe the 1.3% mismatch rate as a decision error rate.
+
+### Decision and unresolved cause
+
+Mark this experiment failed and move on. Keep its implementation and results for reference, with the patch disabled unless explicitly installed. Do not relax numerical tolerances to accept the result.
+
+Two concrete differences could require investigation if this is revisited: the baseline accumulates two 1024-feature chunks while the persistent kernel reduces a full 2048-feature row, and the custom-op/rewritten-decoder boundary may change surrounding fusion and rounding. Neither cause has been confirmed. Matching mathematical expressions and passing a tolerant isolated check were insufficient to establish integrated floating-point equivalence.
+
+A future diagnosis would compare identical inputs at the first affected layer's normalization output, MLP output and final residual output. No such investigation has been performed, and there is currently no integrated performance benefit to justify it as the next priority.

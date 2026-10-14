@@ -377,3 +377,8 @@ If revisiting gates, alternate measurements of already captured packed and combi
 The combined-gate results above are already recorded and remain the reason to leave that optimization experimental. Subsequent inspection prioritized explicit repeated reads in the generated residual-plus-RMSNorm kernel. The replacement now retains complete rows through the reduction, with corrected `XBLOCK` row coverage, persistent-reduction metadata and a launcher.
 
 See [persistent residual RMSNorm](persistent-residual-rmsnorm.md) for motivation, arithmetic/rounding requirements, metadata cleanup and pseudocode. This kernel has not yet been GPU-tested or benchmarked.
+
+
+## Persistent residual RMSNorm: failed experiment
+
+The [persistent residual RMSNorm experiment](persistent-residual-rmsnorm.md#outcome-failed-optimization-experiment) is marked unsuccessful. Batch-one isolated median improved from 39.373 to 20.838 microseconds, but integrated forward median increased from 132.706 to 132.985 ms. Full-logit validation failed on 6,902 of 522,240 entries (1.3%), with maximum absolute difference 0.2421875 against absolute tolerance 0.05 and relative tolerance 0.02. Slot-probability checks were not reached, so this is not a measured decision-accuracy loss. Keep the patch opt-in and disabled by default; the numerical cause has not been established.
