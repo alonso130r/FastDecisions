@@ -2,6 +2,8 @@
 
 Making a one-pass decision model faster, one measured GPU bottleneck at a time.
 
+Read the companion blog post: [Why is my PyTorch model still slow?](https://medium.com/@vijaygoyal0770/why-is-my-pytorch-model-still-slow-d7c97bf5761b).
+
 This repository accompanies a blog post about profiling and optimizing inference for [Mapika/decider-2b](https://huggingface.co/Mapika/decider-2b). It contains the benchmark harness, custom Triton kernels, and experiment notes behind the results. The focus is low-concurrency inference on an NVIDIA L4: one or a few decision streams, where each decision must finish before the next dependent request can begin.
 
 ## What is a one-pass decision model?
