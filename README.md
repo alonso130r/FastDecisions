@@ -16,6 +16,15 @@ The benchmark uses a sample from [Hanno-Labs/decision-bench](https://huggingface
 
 ## What the experiments found
 
+The initial batch-one comparison on the NVIDIA L4 measured request latency, including preparation and readout, before installing packed convolution:
+
+| Execution | Median request latency | p95 request latency |
+| --- | ---: | ---: |
+| Eager | 199.408 ms | 201.216 ms |
+| Compiled | 145.258 ms | 147.474 ms |
+
+Across 100 timed batches, compilation reduced median request latency by **27.16%**, a **1.373× speedup**. CUDA graphs were enabled in the recorded configuration. This comparison includes preparation and readout, so its timings have a different scope from the GPU forward measurements below.
+
 Two changes improved the measured model-forward workload:
 
 - **Packed convolution:** write the causal convolution output in the layout required by the following linear-attention operations, avoiding a repeated copy boundary.
