@@ -2,10 +2,10 @@
 """Download and convert a fixed DecisionBench sample for decider inference profiling.
 
 Usage:
-    .venv/bin/python prepare_decisionbench.py
-    .venv/bin/python prepare_decisionbench.py --rows 1000 --seed 17
+    .venv/bin/python scripts/prepare_decisionbench.py
+    .venv/bin/python scripts/prepare_decisionbench.py --rows 1000 --seed 17
 
-Writes data/decisionbench_profile.jsonl. Each line has `state`, `questions`, and
+Writes artifacts/decisionbench_profile.jsonl. Each line has `state`, `questions`, and
 metadata fields. `questions` can be passed directly to Decider.system_one().
 """
 
@@ -20,7 +20,7 @@ from typing import Any
 
 REPO_ID = "Hanno-Labs/decision-bench"
 SPLIT = "eval"
-OUT = Path(__file__).resolve().parent / "data" / "decisionbench_profile.jsonl"
+OUT = Path(__file__).resolve().parents[1] / "artifacts" / "decisionbench_profile.jsonl"
 
 
 def get(row: dict[str, Any], *keys: str) -> Any:

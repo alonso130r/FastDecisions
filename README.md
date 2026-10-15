@@ -40,17 +40,7 @@ Other experiments explain why isolated kernel speedups are insufficient:
 | Persistent residual RMSNorm | Faster in isolation; integrated numerical validation failed and model latency did not improve. |
 | Project only decision-slot hidden states | No meaningful model-wide latency improvement in the recorded run. |
 
-See the [combined benchmark details](blog/native-gqa.md#combined-result-original-model-versus-both-kernels) for measurement conditions and numerical diagnostics. Results here summarize recorded experiments, rather than promising the same gains on other GPUs or input shapes.
-
-## Read the experiment notes
-
-The notes follow the investigation from profiling to kernel experiments. Earlier sections sometimes describe work that was subsequently completed; read their follow-up and outcome sections for the final results.
-
-1. [Profiling the decision workload](blog/profiling.md): how the workload was measured and how to interpret traces and generated code.
-2. [Batch-one layouts and packed convolution](blog/batch-one-fla-layouts.md): locating the copy boundary and changing the producer's output layout.
-3. [Compiled structure and combined gates](blog/compiled-structure-and-fusion-targets.md): fusion boundaries and the limits of reducing launches.
-4. [Persistent residual RMSNorm](blog/persistent-residual-rmsnorm.md): an isolated improvement that failed integrated validation.
-5. [Native GQA and combined results](blog/native-gqa.md): attention implementation, numerical differences, and the combined benchmark. Later sections also cover decision-slot projection.
+Results summarize recorded experiments rather than promising the same gains on other GPUs or input shapes. See [the experiment guide](experiments/README.md) for entry points and outcomes.
 
 ## Reproduce a GPU run
 
@@ -63,10 +53,10 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install modal huggingface_hub pyarrow tqdm
 python -m modal setup
-python prepare_decisionbench.py --rows 500 --seed 17
+python scripts/prepare_decisionbench.py --rows 500 --seed 17
 ```
 
-This writes `data/decisionbench_profile.jsonl`. The Modal image in `src/benchmark.py` installs the GPU dependencies, including PyTorch, Transformers, Flash Linear Attention, and causal-conv1d, and uploads the local inference code. The remote runner downloads model weights into a persistent cache. A local weight download is unnecessary for this path.
+This writes `artifacts/decisionbench_profile.jsonl`. The Modal image in `benchmarks/benchmark.py` installs the GPU dependencies, including PyTorch, Transformers, Flash Linear Attention, and causal-conv1d, and uploads the local inference code. The remote runner downloads model weights into a persistent cache. A local weight download is unnecessary for this path.
 
 ### Run the combined comparison
 
@@ -74,7 +64,7 @@ This writes `data/decisionbench_profile.jsonl`. The Modal image in `src/benchmar
 sh scripts/bench_combined_speedups.sh
 ```
 
-The script compares original convolution plus SDPA against packed convolution plus native GQA. It saves timings and numerical diagnostics to `data/combined-speedups-model.json`. Read those diagnostics alongside latency before drawing a conclusion about the replacement kernels.
+The script compares original convolution plus SDPA against packed convolution plus native GQA. It saves timings and numerical diagnostics to `artifacts/combined-speedups-model.json`. Read those diagnostics alongside latency before drawing a conclusion about the replacement kernels.
 
 The runner accepts additional options through the script. For a repeatable model selection, supply a specific Hugging Face commit:
 
@@ -87,7 +77,7 @@ The combined runner defaults to model commit `ff99089b6810691bd79134ec6febb5d9af
 ### Capture a compiled profile
 
 ```bash
-modal run src/benchmark.py::modal_main \
+modal run benchmarks/benchmark.py::modal_main \
   --batch-size 1 --rows 1 \
   --warmup-batches 3 --repeats 20 \
   --use-compile --use-cuda-graphs --profile-mode compiled
@@ -101,17 +91,19 @@ The command prints benchmark results and the remote trace location. This entry p
 
 | Path | Purpose |
 | --- | --- |
-| `src/benchmark.py` | Workload timing and profiling, with local CUDA/MPS and remote Modal entry points. |
-| `src/bench_*.py`, `src/check_*.py` | Isolated kernel checks and integrated model experiments. |
-| `src/dump_compiled_code.py` | Capture generated compiled code for inspection. |
-| `model/decider/` | Local Decider inference code and experimental kernel integrations. |
-| `src/kernels/` | Standalone convolution prototypes and reference implementations. |
-| `prepare_decisionbench.py` | Download, sample, and convert the evaluation workload. |
-| `download_model.py` | Download model files for local inference. |
+| `benchmarks/benchmark.py` | Workload timing and profiling, with local CUDA/MPS and remote Modal entry points. |
+| `experiments/` | Benchmarks and checks grouped by optimization, with an [experiment guide](experiments/README.md). |
+| `profiling/dump_compiled_code.py` | Capture generated compiled code for inspection. |
+| `src/decider/` | Local Decider inference code and integrated kernels. |
+| `scripts/prepare_decisionbench.py` | Download, sample, and convert the evaluation workload. |
+| `scripts/download_model.py` | Download model files into `models/` for local inference. |
 | `scripts/bench_combined_speedups.sh` | Run the original-versus-combined model comparison. |
-| `blog/` | Detailed experiment narrative and recorded measurements. |
+| `artifacts/` | Generated datasets, traces, logs, and compiled dumps, ignored by Git. |
+| `models/` | Downloaded weights and model configuration, ignored by Git. |
 
-Model weights and generated `data/` artifacts are ignored by Git. Links in the notes to traces, logs, and compiled dumps refer to artifacts from the original investigation; they are not included in a fresh clone. Downloading the model alone also does not install the dependencies required for local inference. The Modal image is the environment definition used by the GPU workflow.
+Install local preparation tools with `python -m pip install -r requirements.txt`. The Modal image in `benchmarks/benchmark.py` defines the GPU dependencies separately. Downloading the model alone does not install dependencies required for local inference.
+
+Generated artifacts are not included in a fresh clone. Blog drafts remain local and are ignored by Git; the published companion article is linked above.
 
 ## Attribution
 

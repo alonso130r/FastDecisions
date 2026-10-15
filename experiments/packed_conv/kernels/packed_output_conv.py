@@ -2,7 +2,10 @@
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'model'))
+# Local source tree and the inference package uploaded to Modal.
+source = Path(__file__).resolve().parents[3] / 'src'
+sys.path.insert(0, str(source))
+sys.path.insert(0, '/root/model')
 from decider.packed_conv_kernel import (  # noqa: F401,E402
     BASE_TRITON_META,
     BASE_INDUCTOR_META,

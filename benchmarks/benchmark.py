@@ -16,10 +16,10 @@ from typing import Any, Sequence
 from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "model"))
+sys.path.insert(0, str(ROOT / "src"))
 
-DEFAULT_DATA = ROOT / "data" / "decisionbench_profile.jsonl"
-DEFAULT_MODEL = ROOT / "model"
+DEFAULT_DATA = ROOT / "artifacts" / "decisionbench_profile.jsonl"
+DEFAULT_MODEL = ROOT / "models"
 
 
 class InferenceRuntime(ABC):
@@ -379,7 +379,7 @@ def timed_batches(
     runtime.synchronize()
 
     if profile_batches and runtime.device.startswith("mps"):
-        profile_mps(runtime, batches[:profile_batches], trace_path or ROOT / "data" / "mps_profile_trace.json")
+        profile_mps(runtime, batches[:profile_batches], trace_path or ROOT / "artifacts" / "mps_profile_trace.json")
     elif profile_batches:
         profiler = None
         import torch
@@ -456,7 +456,7 @@ def main() -> None:
     )
     parser.add_argument("--profile", action="store_true", help="profile one batch size and export a PyTorch trace")
     parser.add_argument("--profile-batches", type=int, default=5, help="number of batches included in the profiler trace")
-    parser.add_argument("--trace", type=Path, default=ROOT / "data" / "benchmark_trace.json", help="Chrome trace output path")
+    parser.add_argument("--trace", type=Path, default=ROOT / "artifacts" / "benchmark_trace.json", help="Chrome trace output path")
     parser.add_argument(
         "--wait-before-run",
         action="store_true",
@@ -526,7 +526,7 @@ def main() -> None:
 
 
 # Optional Modal entrypoint. The ordinary local benchmark above does not require
-# Modal to be installed. `modal run src/benchmark.py` uses this L4 function.
+# Modal to be installed. `modal run benchmarks/benchmark.py` uses this L4 function.
 try:
     import modal
 except ImportError:  # pragma: no cover - intentionally optional local dependency
@@ -560,7 +560,7 @@ if modal is not None:
             "TOKENIZERS_PARALLELISM": "false",
         })
         .pip_install("causal-conv1d", extra_options="--no-build-isolation")
-        .add_local_dir(str(ROOT / "model" / "decider"), remote_path="/root/model/decider")
+        .add_local_dir(str(ROOT / "src" / "decider"), remote_path="/root/model/decider")
         .add_local_file(str(DEFAULT_DATA), remote_path=MODAL_DATA_PATH)
     )
     modal_app = modal.App("decider-kernel-profile")

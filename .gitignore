@@ -1,8 +1,7 @@
-.venv
-data/
-__pycache__
+.venv/
+__pycache__/
+*.pyc
 tmp/
-model/*
-!model/decider/
-model/decider/*
-!model/decider/*.py
+artifacts/
+models/
+blog/

@@ -7,7 +7,7 @@ import modal
 app = modal.App('native-gqa-diagnostics')
 image = None
 if modal.is_local():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from benchmark import modal_image
     image = modal_image
 
@@ -140,5 +140,5 @@ def diagnose_remote():
 @app.local_entrypoint()
 def main():
     result = diagnose_remote.remote()
-    Path('data/native-gqa-diagnostics.json').write_text(json.dumps(result, indent=2)+'\n')
+    Path('artifacts/native-gqa-diagnostics.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result, indent=2))

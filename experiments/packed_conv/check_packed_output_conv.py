@@ -1,12 +1,12 @@
 """Modal GPU correctness checks for the packed-output convolution prototype.
 
-Run: modal run src/check_packed_output_conv.py
+Run: modal run experiments/packed_conv/check_packed_output_conv.py
 This checks correctness only; it does not report performance.
 """
 from pathlib import Path
 import sys
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def run_checks():
@@ -108,11 +108,11 @@ app = modal.App('packed-output-conv-correctness')
 # whose image recipe also references files that only exist on the host.
 image = None
 if modal.is_local():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from benchmark import modal_image
 
     image = modal_image.add_local_dir(
-        str(ROOT / 'src' / 'kernels'), remote_path='/root/src/kernels'
+        str(ROOT / 'experiments' / 'packed_conv' / 'kernels'), remote_path='/root/src/kernels'
     )
 
 

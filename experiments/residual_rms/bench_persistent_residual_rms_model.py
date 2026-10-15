@@ -11,7 +11,7 @@ import modal
 app = modal.App('persistent-residual-rms-model-benchmark')
 image = None
 if modal.is_local():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from benchmark import modal_image
     image = modal_image
 

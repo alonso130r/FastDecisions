@@ -7,7 +7,7 @@ import modal
 app = modal.App('native-gqa-offline-sweep')
 image = None
 if modal.is_local():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from benchmark import modal_image
     image = modal_image
 
@@ -101,7 +101,7 @@ def sweep_remote(samples: int, replays: int, batches: list[int], sequence_length
 
 @app.local_entrypoint()
 def main(samples: int = 15, replays: int = 20, batches: str = '1,2,4', sequence_length: int = 2048,
-         output: str = 'data/native-gqa-sweep.json'):
+         output: str = 'artifacts/native-gqa-sweep.json'):
     batch_list = [int(x) for x in batches.split(',')]
     if samples < 2 or replays < 1 or sequence_length < 1 or not batch_list or min(batch_list) < 1:
         raise ValueError('Require samples >= 2 and positive replays, batches and sequence length')

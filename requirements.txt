@@ -1,0 +1,6 @@
+# Local data preparation and Modal launch tools.
+# GPU dependencies are defined in benchmarks/benchmark.py.
+modal
+huggingface_hub
+pyarrow
+tqdm

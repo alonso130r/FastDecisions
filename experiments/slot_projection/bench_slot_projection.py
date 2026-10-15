@@ -7,7 +7,7 @@ import modal
 app = modal.App('slot-projection-benchmark')
 image = None
 if modal.is_local():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from benchmark import modal_image
     image = modal_image
 
@@ -242,7 +242,7 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
 def main(rows: int = 4, batch_size: int = 1,
          revision: str = 'ff99089b6810691bd79134ec6febb5d9afa6e619',
          samples: int = 30, replays: int = 10, slot_capacity: int = 0,
-         output: str = 'data/slot-projection-model.json'):
+         output: str = 'artifacts/slot-projection-model.json'):
     if rows < 1 or batch_size < 1 or rows % batch_size:
         raise ValueError('Rows must be positive and divisible by batch size')
     if samples < 2 or replays < 1 or slot_capacity < 0:

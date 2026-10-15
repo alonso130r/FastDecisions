@@ -7,7 +7,7 @@ import modal
 app = modal.App('native-gqa-model-benchmark')
 image = None
 if modal.is_local():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from benchmark import modal_image
     image = modal_image
 
@@ -196,7 +196,7 @@ def bench_remote(rows: int, batch_size: int, revision: str, samples: int, replay
 @app.local_entrypoint()
 def main(rows: int = 4, batch_size: int = 1,
          revision: str = 'ff99089b6810691bd79134ec6febb5d9afa6e619',
-         samples: int = 30, replays: int = 10, output: str = 'data/native-gqa-model.json',
+         samples: int = 30, replays: int = 10, output: str = 'artifacts/native-gqa-model.json',
          original_baseline: bool = False):
     if rows < 1 or batch_size < 1 or rows % batch_size:
         raise ValueError('Rows must be positive and divisible by batch size')

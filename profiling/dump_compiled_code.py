@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "model"))
+sys.path.insert(0, str(ROOT / "src"))
 
-DEFAULT_DATA = ROOT / "data" / "decisionbench_profile.jsonl"
-DEFAULT_MODEL = ROOT / "model"
-DEFAULT_OUTPUT = ROOT / "data" / "compiled_code"
+DEFAULT_DATA = ROOT / "artifacts" / "decisionbench_profile.jsonl"
+DEFAULT_MODEL = ROOT / "models"
+DEFAULT_OUTPUT = ROOT / "artifacts" / "compiled_code"
 MODAL_CACHE_PATH = "/cache"
 MODAL_DATA_PATH = "/root/data/decisionbench_profile.jsonl"
 MODAL_OUTPUT_PATH = "/cache/compiled-code"
@@ -146,7 +146,7 @@ if modal is not None:
             "TOKENIZERS_PARALLELISM": "false",
         })
         .pip_install("causal-conv1d", extra_options="--no-build-isolation")
-        .add_local_dir(str(ROOT / "model" / "decider"), remote_path="/root/model/decider")
+        .add_local_dir(str(ROOT / "src" / "decider"), remote_path="/root/model/decider")
         .add_local_file(str(DEFAULT_DATA), remote_path=MODAL_DATA_PATH)
     )
     modal_app = modal.App("decider-compiled-code")

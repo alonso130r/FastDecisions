@@ -7,7 +7,7 @@ import modal
 app = modal.App('native-gqa-benchmark')
 image = None
 if modal.is_local():
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from benchmark import modal_image
     image = modal_image
 
@@ -97,7 +97,7 @@ def bench_remote(samples: int, replays: int):
 
 
 @app.local_entrypoint()
-def main(samples: int = 30, replays: int = 100, output: str = 'data/native-gqa-benchmark.json'):
+def main(samples: int = 30, replays: int = 100, output: str = 'artifacts/native-gqa-benchmark.json'):
     if samples < 2 or replays < 1:
         raise ValueError('Require samples >= 2 and replays >= 1')
     result = bench_remote.remote(samples, replays)
